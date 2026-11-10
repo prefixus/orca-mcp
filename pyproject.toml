@@ -20,7 +20,7 @@ classifiers = [
     "Topic :: Printing",
 ]
 dependencies = [
-    "mcp>=1.2.0",
+    "mcp>=1.2.0,<2",  # mcp 2.x renamed FastMCP to MCPServer; this code targets 1.x
 ]
 
 [project.optional-dependencies]

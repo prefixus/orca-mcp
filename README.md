@@ -79,6 +79,16 @@ User profiles are discovered from the standard OrcaSlicer config directory (`~/.
 
 Only *user* profiles are enumerated by `list_profiles`. Vendor/system presets still work — pass a path to an exported profile JSON instead of a name.
 
+## Fork notes (prefixus/orca-mcp)
+
+Changes on top of upstream 0.1.0:
+
+- `mcp` pinned to `<2`. `mcp` 2.x renamed `FastMCP`, so a fresh install of 0.1.0 fails at import.
+- `inspect_project`, `slice_project` and `write_profile` added (see tool table).
+- `slice_project` uses `--export-3mf sliced.3mf` with a **relative** name. An absolute path fails, because the CLI joins it onto `--outputdir`.
+- Tested on OrcaSlicer 2.5.0 (macOS, Ender-3 V3 SE). Known limit: the CLI cannot resolve user presets that inherit from system presets, so `slice_model` and `parameter_sweep` fail with user presets. Slice saved 3MF projects instead.
+- Settings in a 3MF's `project_settings.config` are NOT applied by the CLI when edited by hand (checked on 2.5.0). Change settings in the GUI and re-save the project.
+
 ## Tools
 
 | Tool | What it does |
@@ -91,6 +101,9 @@ Only *user* profiles are enumerated by `list_profiles`. Vendor/system presets st
 | `parameter_sweep` | Slice N variants varying one setting, return a comparison table |
 | `get_slice_estimates` | Parse time/filament/settings out of an existing G-code file |
 | `analyze_gcode_layers` | Per-layer fan %, speed range, feature types — Z-windowable |
+| `inspect_project` | (fork) Presets, objects and key settings of a saved 3MF project (read-only) |
+| `slice_project` | (fork) Slice a saved 3MF project; returns `sliced.3mf` (open it in OrcaSlicer to see the sliced plate), OrcaSlicer's plate previews as PNG, G-code and statistics |
+| `write_profile` | (fork) Create a NEW user machine/process/filament preset that inherits from a system preset and sets only the overrides. Never touches existing files; restart OrcaSlicer to see it |
 
 ### Tool reference
 

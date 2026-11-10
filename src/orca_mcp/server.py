@@ -9,6 +9,9 @@ Tools:
   parameter_sweep      - slice N variants varying one parameter, compare
   get_slice_estimates  - parse estimates out of an existing G-code file
   analyze_gcode_layers - per-layer fan/speed/feature stats, Z-windowed
+  inspect_project      - presets, objects and key settings of a saved 3MF project
+  slice_project        - slice a saved 3MF; returns sliced_3mf (open in OrcaSlicer) + previews
+  write_profile        - create a new user preset that inherits from a system preset
 
 Run with:  orca-mcp   (stdio transport, the MCP default)
 """
@@ -16,8 +19,11 @@ Run with:  orca-mcp   (stdio transport, the MCP default)
 from __future__ import annotations
 
 import json
+import re
+import shutil
 import tempfile
 import time
+import zipfile
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
@@ -405,6 +411,208 @@ def analyze_gcode_layers(
                                         max_layers=max_layers)
     except OSError as e:
         return _err(e)
+
+
+# --------------------------------------------------------------------------------------
+# Project-level tools: work on a saved 3MF (settings come from the project itself).
+# --------------------------------------------------------------------------------------
+
+_PREVIEW_RE = re.compile(r"^Metadata/plate_(\d+)\.png$")
+_KEY_PROJECT_SETTINGS = [
+    "printer_settings_id", "print_settings_id", "filament_settings_id",
+    "layer_height", "initial_layer_print_height", "wall_loops", "top_shell_layers",
+    "bottom_shell_layers", "sparse_infill_density", "sparse_infill_pattern",
+    "enable_support", "support_type", "brim_type", "brim_width",
+    "outer_wall_speed", "inner_wall_speed", "sparse_infill_speed", "travel_speed",
+    "nozzle_temperature", "nozzle_temperature_initial_layer", "hot_plate_temp",
+    "fan_max_speed", "fan_min_speed", "close_fan_the_first_x_layers",
+    "retraction_length", "retraction_speed", "z_hop", "seam_position",
+    "slow_down_layer_time",
+]
+
+
+def _bundle_dir() -> Path | None:
+    """OrcaSlicer's bundled system presets: <App>.app/Contents/Resources/profiles (macOS)."""
+    try:
+        exe = Path(find_slicer().argv_prefix[0]).resolve()
+    except SlicerNotFoundError:
+        return None
+    candidate = exe.parents[1] / "Resources" / "profiles"
+    return candidate if candidate.is_dir() else None
+
+
+def _read_project_settings(project: Path) -> dict:
+    with zipfile.ZipFile(project) as z:
+        if "Metadata/project_settings.config" not in z.namelist():
+            raise ValueError(f"not an OrcaSlicer project (no project_settings.config): {project}")
+        return json.loads(z.read("Metadata/project_settings.config"))
+
+
+def _project_objects(project: Path) -> list[dict]:
+    with zipfile.ZipFile(project) as z:
+        if "Metadata/model_settings.config" not in z.namelist():
+            return []
+        xml = z.read("Metadata/model_settings.config").decode("utf-8", "ignore")
+    out = []
+    for m in re.finditer(r'<object id="(\d+)">(.*?)</object>', xml, re.S):
+        name = re.search(r'key="name" value="([^"]*)"', m.group(2))
+        out.append({
+            "id": m.group(1),
+            "name": name.group(1) if name else "?",
+            "parts": len(re.findall(r"<part id=", m.group(2))),
+        })
+    return out
+
+
+@mcp.tool()
+def inspect_project(project_3mf: str) -> dict:
+    """Summarise a saved OrcaSlicer 3MF project: presets, objects and key print settings.
+
+    Read-only. Use it to check what a project contains before slicing or analysing it.
+    """
+    try:
+        p = Path(project_3mf).expanduser()
+        if not p.is_file():
+            raise FileNotFoundError(f"project not found: {p}")
+        s = _read_project_settings(p)
+        return {
+            "project": str(p),
+            "objects": _project_objects(p),
+            "settings": {k: s[k] for k in _KEY_PROJECT_SETTINGS if k in s},
+            "total_keys": len(s),
+        }
+    except (FileNotFoundError, ValueError, zipfile.BadZipFile) as e:
+        return _err(e)
+
+
+@mcp.tool()
+def slice_project(
+    project_3mf: str,
+    plate: int = 0,
+    output_dir: str | None = None,
+    timeout_seconds: int = 900,
+) -> dict:
+    """Slice a saved OrcaSlicer 3MF project and produce a sliced project you can open in OrcaSlicer.
+
+    The settings come from the project itself (change them in the GUI and re-save first).
+    The source file is copied to a run folder and never modified.
+
+    Outputs in the run folder:
+      - sliced.3mf: the project with G-code embedded. Open it in OrcaSlicer to see the sliced plate.
+      - preview_plate_N.png: plate preview rendered by OrcaSlicer (model image, not toolpaths).
+      - plate_N.gcode and plate_N.statistics.json: G-code and per-layer statistics.
+
+    Args:
+        project_3mf: Path to a saved .3mf project.
+        plate: 0 = all plates, N = plate N.
+        output_dir: Where to create the run folder (default: system temp / orca-mcp).
+        timeout_seconds: Kill the slice if it exceeds this.
+    """
+    try:
+        src = Path(project_3mf).expanduser()
+        if not src.is_file():
+            raise FileNotFoundError(f"project not found: {src}")
+        if src.suffix.lower() != ".3mf":
+            raise ValueError("slice_project needs a .3mf project file")
+        out_root = Path(output_dir).expanduser() if output_dir else _default_output_dir()
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        run_dir = out_root / f"{src.stem}-{stamp}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        work = run_dir / src.name
+        shutil.copy2(src, work)
+
+        args: list[str] = []
+        config_roots = prof_mod._config_roots()
+        if config_roots:
+            args += ["--datadir", str(config_roots[0])]
+        args += [
+            "--slice", str(plate),
+            "--export-statistics",
+            "--outputdir", str(run_dir),
+            "--export-3mf", "sliced.3mf",  # relative to --outputdir (absolute paths fail)
+            str(work),
+        ]
+        res = run_slicer(args, timeout=timeout_seconds)
+
+        gcode_files = sorted(run_dir.glob("*.gcode"))
+        if res.returncode != 0 and not gcode_files:
+            raise SlicerError("Slicing failed", returncode=res.returncode,
+                              stdout=res.stdout, stderr=res.stderr)
+
+        result: dict = {
+            "returncode": res.returncode,
+            "run_dir": str(run_dir),
+            "gcode_files": [str(g) for g in gcode_files],
+            "statistics_files": [str(s) for s in sorted(run_dir.glob("*.statistics.json"))],
+            "used_xvfb": res.used_xvfb,
+        }
+        sliced = run_dir / "sliced.3mf"
+        if sliced.is_file():
+            result["sliced_3mf"] = str(sliced)
+            result["previews"] = _extract_previews(sliced, run_dir)
+        if gcode_files:
+            result["estimates"] = gcode_mod.parse_estimates(gcode_files[0])
+        stats = sorted(run_dir.glob("*.statistics.json"))
+        if stats:
+            st = json.loads(stats[0].read_text(encoding="utf-8"))
+            result["statistics"] = {"summary": st.get("summary", {}),
+                                    "objects": st.get("objects", [])}
+        warnings = [w for w in (res.stdout + res.stderr).splitlines() if "got warnings" in w]
+        if warnings:
+            result["warnings"] = warnings
+        return result
+    except (FileNotFoundError, ValueError, SlicerNotFoundError, SlicerError,
+            zipfile.BadZipFile) as e:
+        return _err(e)
+
+
+def _extract_previews(sliced_3mf: Path, run_dir: Path) -> list[str]:
+    """Copy OrcaSlicer's own plate previews out of the 3MF as PNG files."""
+    out = []
+    with zipfile.ZipFile(sliced_3mf) as z:
+        for name in z.namelist():
+            m = _PREVIEW_RE.match(name)
+            if m:
+                dest = run_dir / f"preview_plate_{m.group(1)}.png"
+                dest.write_bytes(z.read(name))
+                out.append(str(dest))
+    return sorted(out)
+
+
+@mcp.tool()
+def write_profile(
+    kind: str,
+    name: str,
+    parent: str,
+    overrides: dict | None = None,
+    overwrite: bool = False,
+) -> dict:
+    """Create a NEW user preset (machine, process or filament) that inherits from a system preset.
+
+    Only writes <OrcaSlicer user dir>/<kind>/<name>.json. Existing files and system presets are
+    never modified. Restart OrcaSlicer afterwards to see the preset in the GUI.
+
+    Args:
+        kind: "machine", "process" or "filament".
+        name: New preset name (must be unique among user presets).
+        parent: System or user preset to inherit from, e.g.
+            "0.20mm Standard @Creality Ender3V3SE 0.4" (process) or
+            "Creality Ender-3 V3 SE 0.4 nozzle" (machine).
+        overrides: Only the settings that differ from the parent, e.g.
+            {"layer_height": "0.16", "wall_loops": "3"}. Per-extruder keys take lists,
+            e.g. {"nozzle_temperature": ["210"], "fan_max_speed": ["100"]}.
+        overwrite: Replace an existing user preset with the same name (default False).
+    """
+    try:
+        return prof_mod.write_user_profile(
+            kind, name, parent, overrides=overrides,
+            overwrite=overwrite, bundle_dir=_bundle_dir(),
+        )
+    except (ValueError, FileNotFoundError, FileExistsError, SlicerNotFoundError) as e:
+        return _err(e)
+    except OSError as e:
+        return _err(e)
+
 
 
 def main() -> None:
